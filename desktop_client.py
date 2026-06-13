@@ -81,6 +81,7 @@ from shared import (
     validate_password,
     validate_username,
     wait_for_game_window,
+    slugify,
 )
 
 ensure_dirs()
@@ -408,8 +409,13 @@ class TelemetryCollector:
             return list(self.events)
 
 
+
 class HeartSensorReader:
-    """Чтение ЧСС из USB/COM-датчика в отдельном потоке."""
+    """Чтение данных Pulse Sensor из USB/COM-датчика в отдельном потоке.
+
+    Датчик может отдавать либо строку вида "IBI: 842 BPM: 71", либо только BPM.
+    При наличии IBI расчёты HRV строятся по межударным интервалам.
+    """
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -418,8 +424,12 @@ class HeartSensorReader:
         self.serial_port = None
         self.port = ""
         self.last_hr: Optional[float] = None
+        self.last_ibi: Optional[float] = None
+        self.last_bpm: Optional[float] = None
         self.last_line = ""
         self.last_error = ""
+        self._ibi_samples: List[float] = []
+        self._bpm_samples: List[float] = []
 
     def available_ports(self) -> List[str]:
         if list_ports is None:
@@ -457,26 +467,66 @@ class HeartSensorReader:
         self.serial_port = None
         self.port = ""
 
-    def _parse_hr(self, line: str) -> Optional[float]:
+    @staticmethod
+    def _parse_pulse_line(line: str) -> Dict[str, Optional[float]]:
+        """Parse Pulse Sensor serial output.
+
+        Supported patterns:
+          - "IBI: 842 BPM: 71"
+          - "BPM: 71"
+          - "842,71"
+          - "IBI=842;BPM=71"
+        """
         line = (line or "").strip()
+        result = {"ibi_ms": None, "bpm": None}
         if not line:
-            return None
-        for token in re.findall(r'[-+]?\d+(?:[\.,]\d+)?', line):
-            try:
-                value = float(token.replace(',', '.'))
-                if 25.0 <= value <= 240.0:
-                    return value
-            except Exception:
-                continue
-        m = re.search(r'(?:hr|chss|pulse|heartrate)\s*[:=]\s*([-+]?\d+(?:[\.,]\d+)?)', line, re.I)
+            return result
+
+        # Prefer labeled values when present.
+        m = re.search(r'\bIBI\s*[:=]\s*([-+]?\d+(?:[\.,]\d+)?)', line, re.I)
         if m:
             try:
-                value = float(m.group(1).replace(',', '.'))
-                if 25.0 <= value <= 240.0:
-                    return value
+                result["ibi_ms"] = float(m.group(1).replace(",", "."))
             except Exception:
-                return None
-        return None
+                pass
+        m = re.search(r'\bBPM\s*[:=]\s*([-+]?\d+(?:[\.,]\d+)?)', line, re.I)
+        if m:
+            try:
+                result["bpm"] = float(m.group(1).replace(",", "."))
+            except Exception:
+                pass
+
+        # Fallback for comma/space separated pairs.
+        if result["ibi_ms"] is None and result["bpm"] is None:
+            nums = []
+            for token in re.findall(r'[-+]?\d+(?:[\.,]\d+)?', line):
+                try:
+                    nums.append(float(token.replace(",", ".")))
+                except Exception:
+                    continue
+            if len(nums) >= 2:
+                # Pulse Sensor serial logs usually print IBI first and BPM second.
+                first, second = nums[0], nums[1]
+                if first >= 250.0:
+                    result["ibi_ms"] = first
+                    result["bpm"] = second if 25.0 <= second <= 240.0 else None
+                else:
+                    # If the first number is too small for IBI, treat it as BPM.
+                    result["bpm"] = first if 25.0 <= first <= 240.0 else None
+                    result["ibi_ms"] = second if second >= 250.0 else None
+            elif len(nums) == 1:
+                value = nums[0]
+                if 25.0 <= value <= 240.0:
+                    result["bpm"] = value
+                elif value >= 250.0:
+                    result["ibi_ms"] = value
+
+        # Reconstruct missing value when possible.
+        if result["ibi_ms"] is None and result["bpm"] is not None and result["bpm"] > 0:
+            result["ibi_ms"] = 60000.0 / result["bpm"]
+        if result["bpm"] is None and result["ibi_ms"] is not None and result["ibi_ms"] > 0:
+            result["bpm"] = 60000.0 / result["ibi_ms"]
+        return result
 
     def _loop(self):
         while self._running and self.serial_port is not None:
@@ -484,11 +534,21 @@ class HeartSensorReader:
                 raw = self.serial_port.readline().decode('utf-8', errors='ignore').strip()
                 if not raw:
                     continue
-                value = self._parse_hr(raw)
+                parsed = self._parse_pulse_line(raw)
                 with self._lock:
                     self.last_line = raw
-                    if value is not None:
-                        self.last_hr = value
+                    if parsed["ibi_ms"] is not None:
+                        self.last_ibi = float(parsed["ibi_ms"])
+                        self._ibi_samples.append(self.last_ibi)
+                        self._ibi_samples = self._ibi_samples[-256:]
+                    if parsed["bpm"] is not None:
+                        self.last_bpm = float(parsed["bpm"])
+                        self._bpm_samples.append(self.last_bpm)
+                        self._bpm_samples = self._bpm_samples[-256:]
+                    if self.last_ibi is not None:
+                        self.last_hr = 60000.0 / max(self.last_ibi, 1e-6)
+                    elif self.last_bpm is not None:
+                        self.last_hr = self.last_bpm
             except Exception as e:
                 self.last_error = str(e)
                 time.sleep(0.2)
@@ -497,9 +557,30 @@ class HeartSensorReader:
         with self._lock:
             return self.last_hr
 
+    def sample_packet(self) -> Dict[str, Optional[float]]:
+        with self._lock:
+            return {
+                "hr": self.last_hr,
+                "ibi_ms": self.last_ibi,
+                "bpm": self.last_bpm,
+                "line": self.last_line,
+            }
+
+    def ibi_series(self) -> List[float]:
+        with self._lock:
+            return list(self._ibi_samples)
+
+    def bpm_series(self) -> List[float]:
+        with self._lock:
+            return list(self._bpm_samples)
+
     def status_text(self) -> str:
         if self.serial_port is None:
             return "Не подключён"
+        if self.last_ibi is not None:
+            return f"Подключён: {self.port} | IBI: {self.last_ibi:.0f} мс | BPM: {self.last_bpm:.0f}" if self.last_bpm is not None else f"Подключён: {self.port} | IBI: {self.last_ibi:.0f} мс"
+        if self.last_bpm is not None:
+            return f"Подключён: {self.port} | BPM: {self.last_bpm:.0f}"
         return f"Подключён: {self.port}"
 
 
@@ -774,6 +855,8 @@ class LivePlayerTab(ttk.Frame):
         self.collector = TelemetryCollector()
         self.heart_sensor = HeartSensorReader()
         self.hr_samples: List[float] = []
+        self.ibi_samples: List[float] = []
+        self.bpm_samples: List[float] = []
         self.recorder: Optional[ScreenRecorder] = None
         self.timeline: List[Dict[str, Any]] = []
         self.current_game_title = ""
@@ -850,7 +933,7 @@ class LivePlayerTab(ttk.Frame):
         metrics.pack(fill="x")
         self.live_vars = {k: tk.StringVar(value="—") for k in ["heart", "telemetry", "ml", "overall", "class", "source", "game"]}
         labels = [
-            ("game", "Окно игры"), ("heart", "ЧСС / HRV"), ("telemetry", "Телеметрия"),
+            ("game", "Окно игры"), ("heart", "ЧСС / IBI / HRV"), ("telemetry", "Телеметрия"),
             ("overall", "Итог"), ("class", "Класс"), ("source", "Источник стресса"),
         ]
         for i, (k, caption) in enumerate(labels):
@@ -1020,42 +1103,85 @@ class LivePlayerTab(ttk.Frame):
         start_ts = self.recorder.start_ts if self.recorder else (self.timeline[0]["t"] if self.timeline else time.time())
         t_rel = max(0.0, time.time() - start_ts)
 
-        hr_value = self.heart_sensor.sample()
+        pulse_packet = self.heart_sensor.sample_packet()
+        hr_value = pulse_packet.get("hr")
+        ibi_value = pulse_packet.get("ibi_ms")
+        bpm_value = pulse_packet.get("bpm")
+
         if hr_value is not None:
             self.hr_samples.append(float(hr_value))
-            self.hr_samples = self.hr_samples[-180:]
-        heart_available = len(self.hr_samples) >= 4
-        if heart_available:
-            rr = [max(300.0, min(1600.0, 60000.0 / max(v, 1e-6))) for v in self.hr_samples[-12:]]
-            rr_arr = np.array(rr, dtype=float)
-            hr_arr = np.array([60000.0 / r for r in rr_arr], dtype=float)
-            if len(rr_arr) > 1:
-                diff_rr = np.diff(rr_arr)
-                sdnn_v = float(np.std(rr_arr, ddof=1))
-                rmssd_v = float(np.sqrt(np.mean(diff_rr ** 2)))
-                pnn50_v = float(np.mean(np.abs(diff_rr) > 50.0))
+            self.hr_samples = self.hr_samples[-256:]
+        if ibi_value is not None:
+            self.ibi_samples.append(float(ibi_value))
+            self.ibi_samples = self.ibi_samples[-256:]
+        if bpm_value is not None:
+            self.bpm_samples.append(float(bpm_value))
+            self.bpm_samples = self.bpm_samples[-256:]
+
+        if len(self.ibi_samples) >= 2:
+            ibi_arr = np.array(self.ibi_samples[-12:], dtype=float)
+            hr_arr = 60000.0 / np.clip(ibi_arr, 1e-6, None)
+            ibi_mean = float(np.mean(ibi_arr))
+            ibi_std = float(np.std(ibi_arr, ddof=1)) if len(ibi_arr) > 1 else 0.0
+            if len(ibi_arr) > 1:
+                diff_ibi = np.diff(ibi_arr)
+                sdnn_v = float(np.std(ibi_arr, ddof=1))
+                rmssd_v = float(np.sqrt(np.mean(diff_ibi ** 2)))
+                pnn50_v = float(np.mean(np.abs(diff_ibi) > 50.0))
             else:
                 sdnn_v = rmssd_v = pnn50_v = 0.0
-            bins = np.round(rr_arr / 50.0) * 50.0
-            if len(bins):
-                unique, counts = np.unique(bins.astype(int), return_counts=True)
-                mode_rr = float(unique[int(np.argmax(counts))]) if len(unique) else 0.0
-                amo = float(100.0 * max(counts) / max(len(rr_arr), 1)) if len(counts) else 0.0
-                baevsky_v = float((amo * 100.0) / max(2.0 * max(mode_rr, 1e-6) * max(np.ptp(rr_arr), 1e-6), 1e-6)) if mode_rr > 0 else 0.0
+
+            rounded = np.round(ibi_arr / 50.0) * 50.0
+            if len(rounded):
+                unique, counts = np.unique(rounded.astype(int), return_counts=True)
+                mode_ibi = float(unique[int(np.argmax(counts))]) if len(unique) else 0.0
+                amo = float(100.0 * max(counts) / max(len(ibi_arr), 1)) if len(counts) else 0.0
+                baevsky_v = float((amo * 100.0) / max(2.0 * max(mode_ibi, 1e-6) * max(np.ptp(ibi_arr), 1e-6), 1e-6)) if mode_ibi > 0 else 0.0
             else:
                 baevsky_v = 0.0
+
             phys = {
                 "hr_mean": float(np.mean(hr_arr)),
                 "hr_std": float(np.std(hr_arr, ddof=1)) if len(hr_arr) > 1 else 0.0,
-                "rr_mean": float(np.mean(rr_arr)),
+                "ibi_mean": ibi_mean,
+                "ibi_std": ibi_std,
+                "rr_mean": ibi_mean,
                 "sdnn": sdnn_v,
                 "rmssd": rmssd_v,
                 "pnn50": pnn50_v,
                 "baevsky": baevsky_v,
+                "ibi_samples": len(ibi_arr),
+                "bpm_mean": float(np.mean(self.bpm_samples[-12:])) if self.bpm_samples else 0.0,
+            }
+            heart = heart_stress_score(phys)
+        elif len(self.hr_samples) >= 2:
+            hr_arr = np.array(self.hr_samples[-12:], dtype=float)
+            ibi_arr = 60000.0 / np.clip(hr_arr, 1e-6, None)
+            ibi_mean = float(np.mean(ibi_arr))
+            ibi_std = float(np.std(ibi_arr, ddof=1)) if len(ibi_arr) > 1 else 0.0
+            if len(ibi_arr) > 1:
+                diff_ibi = np.diff(ibi_arr)
+                sdnn_v = float(np.std(ibi_arr, ddof=1))
+                rmssd_v = float(np.sqrt(np.mean(diff_ibi ** 2)))
+                pnn50_v = float(np.mean(np.abs(diff_ibi) > 50.0))
+            else:
+                sdnn_v = rmssd_v = pnn50_v = 0.0
+            phys = {
+                "hr_mean": float(np.mean(hr_arr)),
+                "hr_std": float(np.std(hr_arr, ddof=1)) if len(hr_arr) > 1 else 0.0,
+                "ibi_mean": ibi_mean,
+                "ibi_std": ibi_std,
+                "rr_mean": ibi_mean,
+                "sdnn": sdnn_v,
+                "rmssd": rmssd_v,
+                "pnn50": pnn50_v,
+                "baevsky": 0.0,
+                "ibi_samples": len(ibi_arr),
+                "bpm_mean": float(np.mean(self.bpm_samples[-12:])) if self.bpm_samples else 0.0,
             }
             heart = heart_stress_score(phys)
         else:
-            phys = {"hr_mean": 0.0, "hr_std": 0.0, "rr_mean": 0.0, "sdnn": 0.0, "rmssd": 0.0, "pnn50": 0.0, "baevsky": 0.0}
+            phys = {"hr_mean": 0.0, "hr_std": 0.0, "ibi_mean": 0.0, "ibi_std": 0.0, "rr_mean": 0.0, "sdnn": 0.0, "rmssd": 0.0, "pnn50": 0.0, "baevsky": 0.0, "ibi_samples": 0, "bpm_mean": 0.0}
             heart = None
 
         tel = telemetry_summary(window, window_seconds=10.0)
@@ -1090,7 +1216,7 @@ class LivePlayerTab(ttk.Frame):
 
     def _render_live(self, row: Dict[str, Any]):
         self.live_vars["game"].set(self.current_game_title)
-        heart_text = "датчик не подключён" if row.get("heart_score") is None else f"{row['heart_score']:.2f} | ЧСС {row['hr_mean']:.0f} уд/мин"
+        heart_text = "датчик не подключён" if row.get("heart_score") is None else f"{row['heart_score']:.2f} | ЧСС {row['hr_mean']:.0f} уд/мин | IBI {row.get('ibi_mean', 0.0):.0f} мс"
         self.live_vars["heart"].set(heart_text)
         self.live_vars["telemetry"].set(f"{row['telemetry_score']:.2f} | ошибки {row['error_rate']:.2f}, клики {row['click_rate']:.2f}")
         self.live_vars["ml"].set(f"{row['ml_score']:.2f} | ML" if self.analysis_mode.get() == "ml" else "—")
@@ -1184,7 +1310,7 @@ class LivePlayerTab(ttk.Frame):
             "ml_score": float(last.get("ml_score", 0.0)),
             "overall_score": float(last.get("overall_score", 0.0)),
             "stress_class": str(last.get("class", "низкий")),
-            "has_rr": bool(last.get("heart_score") is not None),
+            "has_rr": bool(last.get("ibi_samples", 0)),
             "notes": self.notes.get().strip(),
             "ended_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "video_path": str(video_path or ""),
@@ -1506,6 +1632,42 @@ class ResearchTab(ttk.Frame):
         doc.add_heading(heading, level=1)
         doc.add_paragraph(f"Сформировано: {time.strftime('%Y-%m-%d %H:%M:%S')}")
 
+        # --- Таблица игр (строится по переданным сессиям) ---
+        game_stats: Dict[str, Dict[str, Any]] = {}
+        for s in sessions:
+            title_raw = s.get("game_title", "")
+            # Очищаем от переносов строк и лишних пробелов
+            title = " ".join(title_raw.split())
+            if not title:
+                continue
+            if title not in game_stats:
+                game_stats[title] = {"sessions": 0, "players": set()}
+            game_stats[title]["sessions"] += 1
+            player = s.get("player_username") or s.get("player_id")
+            if player:
+                game_stats[title]["players"].add(str(player))
+
+        game_rows = []
+        for title, stats in game_stats.items():
+            game_rows.append([title, stats["sessions"], len(stats["players"])])
+
+        def add_table(title: str, headers: List[str], rows: List[List[Any]]):
+            doc.add_heading(title, level=2)
+            if not rows:
+                doc.add_paragraph("Нет данных.")
+                return
+            table = doc.add_table(rows=1, cols=len(headers))
+            table.style = "Table Grid"
+            hdr = table.rows[0].cells
+            for i, head in enumerate(headers):
+                hdr[i].text = str(head)
+            for row in rows:
+                cells = table.add_row().cells
+                for i, value in enumerate(row):
+                    cells[i].text = str(value)
+
+        add_table("Игры", ["Игра", "Сессий", "Игроков"], game_rows)
+
         def add_table(title: str, headers: List[str], rows: List[List[Any]]):
             doc.add_heading(title, level=2)
             table = doc.add_table(rows=1, cols=len(headers))
@@ -1518,11 +1680,6 @@ class ResearchTab(ttk.Frame):
                 for i, value in enumerate(row):
                     cells[i].text = str(value)
 
-        game_rows = []
-        for g in self.games:
-            title = g.get("title") if isinstance(g, dict) else str(g)
-            game_rows.append([title, g.get("sessions_count", ""), g.get("players_count", "")])
-        add_table("Игры", ["Игра", "Сессий", "Игроков"], game_rows)
 
         player_rows = []
         for p in self.players:

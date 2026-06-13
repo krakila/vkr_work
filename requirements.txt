@@ -15,5 +15,8 @@ python-multipart
 pynput
 sounddevice
 python-docx
-
+pytest-cov
+requests-mock
+httpx
+slugify
 pygetwindow

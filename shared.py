@@ -1,4 +1,3 @@
-
 """Общие сущности, формулы и ML-утилиты для ИС анализа стресса."""
 
 from __future__ import annotations
@@ -134,6 +133,12 @@ _TELEMETRY_BASELINE = {
     "mouse_spike_rate": 0.03,
 }
 
+# === Новые константы для работы с датчиком пульса ===
+DEFAULT_HR_BAUDRATE = 115200
+DEFAULT_HR_SERIAL_TIMEOUT = 1.0
+HRV_MIN_IBI_MS = 250.0      # Минимальный межпиковый интервал (240 уд/мин)
+HRV_MAX_IBI_MS = 2000.0     # Максимальный (30 уд/мин)
+HRV_WINDOW_SEC = 30.0       # Окно для скользящих HRV-метрик
 
 def ensure_dirs() -> None:
     for p in (DATA_DIR, MEDIA_DIR, MODELS_DIR, CACHE_DIR):
@@ -961,8 +966,7 @@ class StressML:
                 self.model = grid.best_estimator_
 
         # Калибратор для итогового индекса: отдельная логистическая регрессия
-        # по трём подиндексам. Здесь не используем несуществующий параметр
-        # positive=True, а после обучения работаем через predict_proba.
+        # по трём подиндексам.
         subX = np.asarray([[to_float(r.get("heart_score", 0.0)),
                             to_float(r.get("telemetry_score", 0.0)),
                             to_float(r.get("ml_prob", 0.5))] for r in rows], dtype=float)
@@ -1001,23 +1005,11 @@ class StressML:
                 model_prob = float(self.model.predict(X)[0])
         except Exception:
             return prior
-        # Модель ML не должна быть изолированной от игровой динамики: если
-        # она дает почти постоянный ответ, prior от поведенческих признаков
-        # удерживает выход от деградации в одну фиксированную величину.
         blended = 0.68 * model_prob + 0.32 * prior
         return clip01(blended)
 
     def combine(self, heart_score: float, telemetry_score: float, ml_prob: float) -> float:
         if self.combiner is None:
-            return combine_stress_scores(heart_score, telemetry_score, ml_prob)
-        try:
-            x = np.asarray([[heart_score, telemetry_score, ml_prob]], dtype=float)
-            if hasattr(self.combiner, "predict_proba"):
-                return float(self.combiner.predict_proba(x)[0, 1])
-            return float(self.combiner.predict(x)[0])
-        except Exception:
-            return combine_stress_scores(heart_score, telemetry_score, ml_prob)
-
             return combine_stress_scores(heart_score, telemetry_score, ml_prob)
         try:
             x = np.asarray([[heart_score, telemetry_score, ml_prob]], dtype=float)
@@ -1055,8 +1047,7 @@ def calibrate_rule_weights(rows: Sequence[Dict[str, Any]], labels: Sequence[int]
         return dict(DEFAULT_WEIGHTS)
 
     # Оцениваем связь между подиндексами и целевой меткой через
-    # регуляризованную логистическую регрессию. Это делает вклад каждого
-    # канала обоснованным данными, а не жестко заданным.
+    # регуляризованную логистическую регрессию.
     try:
         model = Pipeline([
             ("scaler", StandardScaler()),
@@ -1198,7 +1189,6 @@ def wait_for_game_window(timeout: float = 0.0, hint: str = "") -> str:
         time.sleep(0.25)
 
 
-
 def sample_summary_text(parts: StressParts, has_rr: bool) -> str:
     rr_text = "RR-данные доступны" if has_rr else "RR-данные отсутствуют, HRV-метрики отключены"
     return (
@@ -1207,3 +1197,136 @@ def sample_summary_text(parts: StressParts, has_rr: bool) -> str:
         f"ML: {parts.ml_score:.2f}; "
         f"Итог: {parts.overall_score:.2f}. {rr_text}"
     )
+
+
+# ============================================================================
+# Дополнительные функции для работы с датчиком пульса (IBI/BPM) и HRV
+# (перенесены из desktop_client_ibi_updated.py)
+# ============================================================================
+
+def parse_pulse_serial_line(line: str) -> Dict[str, Optional[float]]:
+    """
+    Разбирает строку, полученную с датчика пульса (Pulse Sensor, Photoplethysmogram).
+    Поддерживаемые форматы:
+      - "IBI: 842 BPM: 71"
+      - "BPM: 71"
+      - "842,71"
+      - "IBI=842;BPM=71"
+    Возвращает словарь с ключами 'ibi_ms' (межпиковый интервал в мс) и 'bpm'.
+    """
+    line = (line or "").strip()
+    result: Dict[str, Optional[float]] = {"ibi_ms": None, "bpm": None}
+    if not line:
+        return result
+
+    # Ищем маркированные значения
+    m_ibi = re.search(r'\bIBI\s*[:=]\s*([-+]?\d+(?:[\.,]\d+)?)', line, re.I)
+    m_bpm = re.search(r'\bBPM\s*[:=]\s*([-+]?\d+(?:[\.,]\d+)?)', line, re.I)
+    if m_ibi:
+        try:
+            result["ibi_ms"] = float(m_ibi.group(1).replace(",", "."))
+        except Exception:
+            pass
+    if m_bpm:
+        try:
+            result["bpm"] = float(m_bpm.group(1).replace(",", "."))
+        except Exception:
+            pass
+
+    # Если не нашли маркированных, пытаемся извлечь числа
+    if result["ibi_ms"] is None and result["bpm"] is None:
+        numbers = []
+        for token in re.findall(r'[-+]?\d+(?:[\.,]\d+)?', line):
+            try:
+                numbers.append(float(token.replace(",", ".")))
+            except Exception:
+                continue
+        if len(numbers) >= 2:
+            # Обычно IBI идёт первым, BPM — вторым
+            first, second = numbers[0], numbers[1]
+            if first >= HRV_MIN_IBI_MS:
+                result["ibi_ms"] = first
+                result["bpm"] = second if 25.0 <= second <= 240.0 else None
+            else:
+                result["bpm"] = first if 25.0 <= first <= 240.0 else None
+                result["ibi_ms"] = second if second >= HRV_MIN_IBI_MS else None
+        elif len(numbers) == 1:
+            val = numbers[0]
+            if 25.0 <= val <= 240.0:
+                result["bpm"] = val
+            elif val >= HRV_MIN_IBI_MS:
+                result["ibi_ms"] = val
+
+    # Восстанавливаем недостающее значение, если возможно
+    if result["ibi_ms"] is None and result["bpm"] is not None and result["bpm"] > 0:
+        result["ibi_ms"] = 60000.0 / result["bpm"]
+    if result["bpm"] is None and result["ibi_ms"] is not None and result["ibi_ms"] > 0:
+        result["bpm"] = 60000.0 / result["ibi_ms"]
+
+    return result
+
+
+def compute_hrv_from_ibi(ibi_series: Sequence[float]) -> Dict[str, float]:
+    """
+    Вычисляет стандартные HRV-метрики по списку межпиковых интервалов (в миллисекундах).
+    Возвращает словарь с ключами: 'sdnn', 'rmssd', 'pnn50', 'baevsky', 'mean_ibi', 'std_ibi', 'count'.
+    Если данных недостаточно (<2), все значения равны 0.0.
+    """
+    ibi = [float(v) for v in ibi_series if v is not None and HRV_MIN_IBI_MS <= v <= HRV_MAX_IBI_MS]
+    if len(ibi) < 2:
+        return {
+            "sdnn": 0.0, "rmssd": 0.0, "pnn50": 0.0, "baevsky": 0.0,
+            "mean_ibi": mean(ibi), "std_ibi": stdev(ibi), "count": len(ibi)
+        }
+
+    # Используем существующие функции shared.py
+    sdnn_val = sdnn(ibi)
+    rmssd_val = rmssd(ibi)
+    pnn50_val = pnn50(ibi)
+    baevsky_val = baevsky_stress_index(ibi)
+
+    return {
+        "sdnn": sdnn_val,
+        "rmssd": rmssd_val,
+        "pnn50": pnn50_val,
+        "baevsky": baevsky_val,
+        "mean_ibi": mean(ibi),
+        "std_ibi": stdev(ibi),
+        "count": len(ibi),
+    }
+
+
+def ibi_to_hr(ibi_ms: float) -> float:
+    """Переводит межпиковый интервал (мс) в частоту сердечных сокращений (уд/мин)."""
+    if ibi_ms is None or ibi_ms <= 0:
+        return 0.0
+    return 60000.0 / ibi_ms
+
+
+def hr_to_ibi(bpm: float) -> float:
+    """Переводит ЧСС (уд/мин) в межпиковый интервал (мс)."""
+    if bpm is None or bpm <= 0:
+        return 0.0
+    return 60000.0 / bpm
+
+
+def heart_stress_score_from_ibi(ibi_series: Sequence[float]) -> float:
+    """
+    Вычисляет физиологический индекс стресса непосредственно по сырым IBI.
+    Использует те же веса, что и heart_stress_score, но принимает список IBI.
+    """
+    hrv = compute_hrv_from_ibi(ibi_series)
+    if hrv["count"] < 2:
+        return 0.0
+    hr_mean = ibi_to_hr(hrv["mean_ibi"])
+    # Приблизительная оценка hr_std через преобразование IBI
+    hr_std = hr_mean - ibi_to_hr(hrv["mean_ibi"] + hrv["std_ibi"]) if hrv["std_ibi"] > 0 else 0.0
+    feat = {
+        "hr_mean": hr_mean,
+        "hr_std": max(0.0, hr_std),
+        "sdnn": hrv["sdnn"],
+        "rmssd": hrv["rmssd"],
+        "pnn50": hrv["pnn50"],
+        "baevsky": hrv["baevsky"],
+    }
+    return heart_stress_score(feat)
